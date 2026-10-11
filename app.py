@@ -1,11 +1,10 @@
 
 import streamlit as st
-import requests
 from io import BytesIO
 from pypdf import PdfReader
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
+from groq import Groq
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 # -------------------------------
@@ -14,7 +13,8 @@ from langchain_core.embeddings import Embeddings
 
 st.set_page_config(
     page_title="PDF RAG Chatbot",
-    page_icon="📚"
+    page_icon="📚",
+    layout="centered"
 )
 
 st.title("📚 PDF RAG Chatbot")
@@ -22,7 +22,7 @@ st.write("Upload a PDF and ask questions about its content.")
 
 
 # -------------------------------
-# Initialize chat history
+# Chat history
 # -------------------------------
 
 if "messages" not in st.session_state:
@@ -34,43 +34,17 @@ for message in st.session_state.messages:
 
 
 # -------------------------------
-# Create embeddings using Ollama
+# Extract and split PDF text
 # -------------------------------
 
-class OllamaEmbeddings(Embeddings):
-
-    def embed_documents(self, texts):
-        response = requests.post(
-            "http://localhost:11434/api/embed",
-            json={
-                "model": "nomic-embed-text",
-                "input": texts
-            },
-            timeout=120
-        )
-
-        response.raise_for_status()
-        return response.json()["embeddings"]
-
-    def embed_query(self, text):
-        return self.embed_documents([text])[0]
-
-
-# -------------------------------
-# Create cached vector store
-# -------------------------------
-
-@st.cache_resource(show_spinner=False)
-def create_vector_store_v2(pdf_bytes):
-
+def extract_pdf_chunks(pdf_bytes):
     pdf = PdfReader(BytesIO(pdf_bytes))
-    documents = []
+    chunks = []
 
     chunk_size = 500
     chunk_overlap = 50
 
     for page_number, page in enumerate(pdf.pages, start=1):
-
         page_text = page.extract_text()
 
         if not page_text or not page_text.strip():
@@ -80,33 +54,109 @@ def create_vector_store_v2(pdf_bytes):
 
         while start < len(page_text):
             end = start + chunk_size
-            chunk = page_text[start:end]
+            chunk_text = page_text[start:end].strip()
 
-            documents.append(
-                Document(
-                    page_content=chunk,
-                    metadata={"page": page_number}
-                )
-            )
+            if chunk_text:
+                chunks.append({
+                    "text": chunk_text,
+                    "page": page_number
+                })
 
             if end >= len(page_text):
                 break
 
             start = end - chunk_overlap
 
-    if not documents:
+    if not chunks:
         raise ValueError(
-            "No readable text found in this PDF."
+            "No readable text was found in this PDF. "
+            "It may be a scanned PDF without selectable text."
         )
 
-    embeddings = OllamaEmbeddings()
+    return chunks
 
-    vector_store = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings
+
+# -------------------------------
+# Retrieve relevant chunks
+# -------------------------------
+
+def retrieve_chunks(chunks, question, top_k=5):
+    texts = [chunk["text"] for chunk in chunks]
+
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2)
     )
 
-    return vector_store
+    document_vectors = vectorizer.fit_transform(texts)
+    question_vector = vectorizer.transform([question])
+
+    similarities = cosine_similarity(
+        question_vector,
+        document_vectors
+    ).flatten()
+
+    ranked_indices = similarities.argsort()[::-1]
+
+    results = []
+
+    for index in ranked_indices:
+        if similarities[index] <= 0:
+            break
+
+        results.append(chunks[index])
+
+        if len(results) >= top_k:
+            break
+
+    return results
+
+
+# -------------------------------
+# Generate answer with Groq
+# -------------------------------
+
+def generate_answer(question, results):
+    context = "\n\n".join(
+        f"[PDF Page {item['page']}]\n{item['text']}"
+        for item in results
+    )
+
+    client = Groq(
+        api_key=st.secrets["GROQ_API_KEY"]
+    )
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a PDF question-answering assistant. "
+                    "Answer only using the supplied PDF context. "
+                    "Use clear, simple English. Do not invent facts. "
+                    "If the context does not contain the answer, "
+                    "reply exactly: "
+                    "I could not find this information in your PDF."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"PDF context:\n{context}\n\n"
+                    f"Question: {question}"
+                )
+            }
+        ],
+        temperature=0.1
+    )
+
+    answer = response.choices[0].message.content
+
+    if not answer:
+        raise ValueError("The AI service returned an empty answer.")
+
+    return answer.strip()
 
 
 # -------------------------------
@@ -119,15 +169,16 @@ uploaded_file = st.file_uploader(
 )
 
 question = st.text_input(
-    "Ask a question about your PDF:"
+    "Ask a question about your PDF:",
+    placeholder="e.g. Which CYP enzymes are important in drug metabolism?"
 )
 
 
 # -------------------------------
-# Process the question
+# Answer the question
 # -------------------------------
 
-if st.button("Get Answer"):
+if st.button("Get Answer", type="primary"):
 
     if uploaded_file is None:
         st.warning("Please upload a PDF first.")
@@ -137,97 +188,44 @@ if st.button("Get Answer"):
 
     else:
         try:
-
-            # Prepare the PDF
-            with st.spinner("Preparing your PDF..."):
-
+            with st.spinner("Reading your PDF..."):
                 pdf_bytes = uploaded_file.getvalue()
+                chunks = extract_pdf_chunks(pdf_bytes)
 
-                vector_store = create_vector_store_v2(
-                    pdf_bytes
+            with st.spinner("Searching the PDF..."):
+                results = retrieve_chunks(
+                    chunks,
+                    question.strip(),
+                    top_k=5
                 )
 
-                chunk_count = vector_store._collection.count()
-
-            # Retrieve relevant PDF chunks
-            with st.spinner("Finding relevant information..."):
-
-                results = vector_store.similarity_search(
-                    question,
-                    k=min(5, chunk_count)
+            if not results:
+                answer = (
+                    "I could not find this information in your PDF."
                 )
 
-                context = "\n\n".join(
-                    f"[PDF Page {document.metadata.get('page', 'Unknown')}]\n"
-                    f"{document.page_content}"
-                    for document in results
+            else:
+                with st.spinner("Generating your answer..."):
+                    answer = generate_answer(question.strip(), results)
+
+                missing_answer = (
+                    "could not find this information in your PDF"
+                    in answer.lower()
                 )
 
-            # Generate the answer using Ollama
-            with st.spinner("Generating your answer..."):
+                if not missing_answer:
+                    source_pages = sorted({
+                        item["page"] for item in results
+                    })
 
-                prompt = f"""
-You are a helpful PDF assistant.
+                    answer += (
+                        "\n\nSource pages: "
+                        + ", ".join(map(str, source_pages))
+                    )
 
-Answer the user's question using only the information
-provided in the context.
-
-Rules:
-1. Give a clear, direct answer in simple English.
-2. Use only facts found in the provided context.
-3. Do not invent facts or page numbers.
-4. If the answer is not available in the context, say:
-   "I could not find this information in your PDF."
-5. If the context only partially answers the question,
-   explain the limitation.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-
-                response = requests.post(
-                    "http://localhost:11434/api/generate",
-                    json={
-                        "model": "llama3.2:3b",
-                        "prompt": prompt,
-                        "stream": False
-                    },
-                    timeout=180
-                )
-
-                response.raise_for_status()
-
-                answer = response.json()["response"].strip()
-
-            # Add source page citations automatically
-            source_pages = sorted({
-                document.metadata.get("page")
-                for document in results
-                if document.metadata.get("page") is not None
-            })
-
-            # Check whether the answer indicates missing information
-            missing_answer = (
-                "I could not find this information in your PDF."
-                in answer
-            )
-
-            if not missing_answer and source_pages:
-                pages_text = ", ".join(
-                    str(page) for page in source_pages
-                )
-
-                answer += f"\n\nSource pages: {pages_text}"
-
-            # Save question and answer to chat history
             st.session_state.messages.append({
                 "role": "user",
-                "content": question
+                "content": question.strip()
             })
 
             st.session_state.messages.append({
@@ -235,34 +233,26 @@ Answer:
                 "content": answer
             })
 
-            # Display the current question and answer
             with st.chat_message("user"):
-                st.write(question)
+                st.write(question.strip())
 
             with st.chat_message("assistant"):
                 st.write(answer)
 
-            # Display retrieved text and PDF page numbers
-            with st.expander("View retrieved PDF text"):
+            if results:
+                with st.expander("View retrieved PDF text"):
+                    for index, item in enumerate(results, start=1):
+                        st.markdown(
+                            f"**Relevant section {index} — "
+                            f"PDF Page {item['page']}**"
+                        )
+                        st.write(item["text"])
 
-                for i, document in enumerate(results, start=1):
+        except Exception as error:
+            st.error(f"Something went wrong: {error}")
 
-                    page_number = document.metadata.get(
-                        "page",
-                        "Unknown"
-                    )
-
-                    st.markdown(
-                        f"**Relevant section {i} — PDF Page {page_number}**"
-                    )
-
-                    st.write(document.page_content)
-
-        except Exception as e:
-
-            st.error(f"Something went wrong: {e}")
-
-            st.info(
-                "Check that Ollama is running and these models "
-                "are installed: nomic-embed-text and llama3.2:3b."
-            )
+            if "GROQ_API_KEY" in str(error):
+                st.info(
+                    "Check that GROQ_API_KEY is configured in "
+                    "Streamlit Cloud Secrets."
+                )

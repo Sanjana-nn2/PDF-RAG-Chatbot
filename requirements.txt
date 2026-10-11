@@ -1,6 +1,5 @@
 
 streamlit
-requests
 pypdf
-langchain-chroma
-langchain-core
+groq
+scikit-learn
